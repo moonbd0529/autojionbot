@@ -8,7 +8,7 @@ from flask_socketio import SocketIO, emit, join_room
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from threading import Thread
-from config import BOT_TOKEN, DASHBOARD_PASSWORD, CHANNEL_ID, GROUP_INVITE_LINK, CHANNEL_URL
+from config import BOT_TOKEN, DASHBOARD_PASSWORD, CHANNEL_ID, CHANNEL_URL
 import datetime
 import traceback
 
@@ -239,7 +239,7 @@ def chat_messages(user_id):
 
 @app.route('/get_channel_invite_link', methods=['GET'])
 def get_channel_invite_link():
-    return jsonify({'invite_link': GROUP_INVITE_LINK})
+    return jsonify({'invite_link': CHANNEL_URL})
 
 # ... (rest of your existing code remains the same)
 

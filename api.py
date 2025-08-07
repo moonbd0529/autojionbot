@@ -25,6 +25,7 @@ import config  # config.py should have BOT_TOKEN, API_ID, API_HASH, CHAT_ID, WEL
 from telegram.ext import filters as tg_filters
 from pyrogram import filters as pyro_filters
 from telegram import InputMediaPhoto, InputMediaVideo, InputMediaAudio
+from telegram.request import HTTPXRequest as Request
 
 app = Flask(__name__)
 app.secret_key = 'change_this_secret_key'
@@ -260,23 +261,14 @@ def chat_messages(user_id):
 @app.route('/get_channel_invite_link', methods=['GET'])
 def get_channel_invite_link():
     try:
-        future = asyncio.run_coroutine_threadsafe(
-            bot.create_chat_invite_link(
-                chat_id=CHANNEL_ID,
-                member_limit=1,
-                name=f"AdminPanelInvite-{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            ),
-            loop
-        )
-        chat = future.result()
-        invite_link = chat.invite_link
-        return jsonify({'invite_link': invite_link})
+        # Use static URL from config instead of generating dynamic link
+        return jsonify({'invite_link': CHANNEL_URL})
     except Exception as e:
         print(f"Error getting invite link: {e}")
         return jsonify({'error': str(e)}), 500
 
 # --- Telegram Bot Handlers ---
-bot = Bot(BOT_TOKEN)
+bot = Bot(BOT_TOKEN, request=Request(connect_timeout=30, read_timeout=30))
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
@@ -572,9 +564,7 @@ def chat_send(user_id):
 
     # Handle files
     if files and len(files) > 0:
-        images = []
-        videos = []
-        audios = []
+        media_group = []  # Unified media group for all types
         temp_paths = []
         
         # File size validation (Telegram limits: 50MB for files, 20MB for photos)
@@ -604,140 +594,147 @@ def chat_send(user_id):
             is_gif = is_gif_file(temp_path, mimetype=mimetype, original_filename=filename)
             print(f"Debug - admin upload: filename={filename}, mimetype={mimetype}, is_gif={is_gif}")
             
+            # Add to unified media group
             if mimetype.startswith('image/'):
-                images.append(InputMediaPhoto(open(temp_path, 'rb')))
+                media_group.append(InputMediaPhoto(open(temp_path, 'rb')))
             elif mimetype.startswith('video/'):
-                videos.append(InputMediaVideo(open(temp_path, 'rb')))
+                media_group.append(InputMediaVideo(open(temp_path, 'rb')))
             elif mimetype.startswith('audio/'):
-                audios.append(InputMediaAudio(open(temp_path, 'rb')))
+                media_group.append(InputMediaAudio(open(temp_path, 'rb')))
         
         try:
-            if images:
-                if len(images) > 1:
-                    print('Sending media group (images)...')
-                    fut = asyncio.run_coroutine_threadsafe(
-                        bot.send_media_group(chat_id=int(user_id), media=images), loop
-                    )
-                    result = fut.result()
-                    # Save each image URL separately
-                    for i, msg in enumerate(result):
+            if len(media_group) > 1:
+                print(f'Sending unified media group ({len(media_group)} files)...')
+                fut = asyncio.run_coroutine_threadsafe(
+                    bot.send_media_group(chat_id=int(user_id), media=media_group), loop
+                )
+                result = fut.result(timeout=120)  # 120 second timeout for bulk upload
+                
+                # Save each media URL separately
+                for i, msg in enumerate(result):
+                    try:
+                        file_url = None
+                        media_type = None
+                        
                         if msg.photo:
                             file = asyncio.run_coroutine_threadsafe(
                                 bot.get_file(msg.photo[-1].file_id), loop
-                            ).result()
+                            ).result(timeout=30)
+                            media_type = 'image'
+                        elif msg.video:
+                            file = asyncio.run_coroutine_threadsafe(
+                                bot.get_file(msg.video.file_id), loop
+                            ).result(timeout=30)
+                            media_type = 'video'
+                        elif msg.audio:
+                            file = asyncio.run_coroutine_threadsafe(
+                                bot.get_file(msg.audio.file_id), loop
+                            ).result(timeout=30)
+                            media_type = 'audio'
+                        
+                        if file:
                             # Check if file_path already contains the full URL
                             if file.file_path.startswith('http'):
                                 file_url = file.file_path
                             else:
                                 file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
                             
-                            # For admin uploads, we need to check the original file info
-                            # Since Telegram converts GIFs to JPG, we need to track this
+                            # For admin uploads, check the original file info
                             original_filename = files[i].filename if i < len(files) else None
                             original_mimetype = files[i].mimetype if i < len(files) else None
                             is_gif = is_gif_file(file.file_path, mimetype=original_mimetype, original_filename=original_filename)
                             
-                            print(f"Debug - admin file.file_path: {file.file_path}")
-                            print(f"Debug - admin constructed URL: {file_url}")
-                            print(f"Debug - admin original filename: {original_filename}")
-                            print(f"Debug - admin original mimetype: {original_mimetype}")
-                            print(f"Debug - admin is GIF: {is_gif}")
+                            print(f"Debug - admin bulk {media_type}: {file.file_path}")
+                            print(f"Debug - admin bulk URL: {file_url}")
+                            print(f"Debug - admin bulk original: {original_filename}")
+                            print(f"Debug - admin bulk is GIF: {is_gif}")
                             
-                            # Save with appropriate prefix for GIFs
+                            # Save with appropriate prefix
+                            if media_type == 'image':
+                                if is_gif:
+                                    save_message(user_id, 'admin', f'[gif]{file_url}')
+                                else:
+                                    save_message(user_id, 'admin', f'[image]{file_url}')
+                            elif media_type == 'video':
+                                save_message(user_id, 'admin', f'[video]{file_url}')
+                            elif media_type == 'audio':
+                                save_message(user_id, 'admin', f'[audio]{file_url}')
+                            
+                            print(f"Debug - Admin bulk {media_type} saved: [{media_type}]{file_url}")
+                    except Exception as e:
+                        print(f"Error processing bulk media {i}: {e}")
+                        # Still save the message even if we can't get the file URL
+                        save_message(user_id, 'admin', f'[{media_type}]sent')
+                
+                sent = True
+            elif len(media_group) == 1:
+                # Single file - send individually
+                media = media_group[0]
+                if isinstance(media, InputMediaPhoto):
+                    print('Sending single image...')
+                    fut = asyncio.run_coroutine_threadsafe(
+                        bot.send_photo(chat_id=int(user_id), photo=media.media), loop
+                    )
+                    result = fut.result(timeout=60)
+                    if result.photo:
+                        try:
+                            file = asyncio.run_coroutine_threadsafe(
+                                bot.get_file(result.photo[-1].file_id), loop
+                            ).result(timeout=30)
+                            if file.file_path.startswith('http'):
+                                file_url = file.file_path
+                            else:
+                                file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+                            
+                            original_filename = files[0].filename if files else None
+                            original_mimetype = files[0].mimetype if files else None
+                            is_gif = is_gif_file(file.file_path, mimetype=original_mimetype, original_filename=original_filename)
+                            
                             if is_gif:
                                 save_message(user_id, 'admin', f'[gif]{file_url}')
                             else:
                                 save_message(user_id, 'admin', f'[image]{file_url}')
-                else:
-                    print('Sending single image...')
-                    fut = asyncio.run_coroutine_threadsafe(
-                        bot.send_photo(chat_id=int(user_id), photo=images[0].media), loop
-                    )
-                    result = fut.result()
-                    if result.photo:
-                        file = asyncio.run_coroutine_threadsafe(
-                            bot.get_file(result.photo[-1].file_id), loop
-                        ).result()
-                        # Check if file_path already contains the full URL
-                        if file.file_path.startswith('http'):
-                            file_url = file.file_path
-                        else:
-                            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-                        
-                        # For single image, check the original file info
-                        original_filename = files[0].filename if files else None
-                        original_mimetype = files[0].mimetype if files else None
-                        is_gif = is_gif_file(file.file_path, mimetype=original_mimetype, original_filename=original_filename)
-                        
-                        print(f"Debug - admin single file.file_path: {file.file_path}")
-                        print(f"Debug - admin single constructed URL: {file_url}")
-                        print(f"Debug - admin single original filename: {original_filename}")
-                        print(f"Debug - admin single original mimetype: {original_mimetype}")
-                        print(f"Debug - admin single is GIF: {is_gif}")
-                        
-                        # Save with appropriate prefix for GIFs
-                        if is_gif:
-                            save_message(user_id, 'admin', f'[gif]{file_url}')
-                        else:
-                            save_message(user_id, 'admin', f'[image]{file_url}')
-                sent = True
-            if videos:
-                if len(videos) > 1:
-                    print('Sending media group (videos)...')
-                    fut = asyncio.run_coroutine_threadsafe(
-                        bot.send_media_group(chat_id=int(user_id), media=videos), loop
-                    )
-                    result = fut.result()
-                    # Save each video URL separately
-                    for i, msg in enumerate(result):
-                        if msg.video:
-                            file = asyncio.run_coroutine_threadsafe(
-                                bot.get_file(msg.video.file_id), loop
-                            ).result()
-                            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-                            save_message(user_id, 'admin', f'[video]{file_url}')
-                            print(f"Debug - Admin video saved: [video]{file_url}")
-                else:
+                        except Exception as e:
+                            print(f"Error processing single image: {e}")
+                            save_message(user_id, 'admin', f'[image]sent')
+                elif isinstance(media, InputMediaVideo):
                     print('Sending single video...')
                     fut = asyncio.run_coroutine_threadsafe(
-                        bot.send_video(chat_id=int(user_id), video=videos[0].media), loop
+                        bot.send_video(chat_id=int(user_id), video=media.media), loop
                     )
-                    result = fut.result()
+                    result = fut.result(timeout=60)
                     if result.video:
-                        file = asyncio.run_coroutine_threadsafe(
-                            bot.get_file(result.video.file_id), loop
-                        ).result()
-                        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-                        save_message(user_id, 'admin', f'[video]{file_url}')
-                        print(f"Debug - Admin single video saved: [video]{file_url}")
-                sent = True
-            if audios:
-                if len(audios) > 1:
-                    print('Sending media group (audios)...')
-                    fut = asyncio.run_coroutine_threadsafe(
-                        bot.send_media_group(chat_id=int(user_id), media=audios), loop
-                    )
-                    result = fut.result()
-                    # Save each audio URL separately
-                    for i, msg in enumerate(result):
-                        if msg.audio:
+                        try:
                             file = asyncio.run_coroutine_threadsafe(
-                                bot.get_file(msg.audio.file_id), loop
-                            ).result()
-                            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-                            save_message(user_id, 'admin', f'[audio]{file_url}')
-                else:
+                                bot.get_file(result.video.file_id), loop
+                            ).result(timeout=30)
+                            if file.file_path.startswith('http'):
+                                file_url = file.file_path
+                            else:
+                                file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+                            save_message(user_id, 'admin', f'[video]{file_url}')
+                        except Exception as e:
+                            print(f"Error processing single video: {e}")
+                            save_message(user_id, 'admin', f'[video]sent')
+                elif isinstance(media, InputMediaAudio):
                     print('Sending single audio...')
                     fut = asyncio.run_coroutine_threadsafe(
-                        bot.send_audio(chat_id=int(user_id), audio=audios[0].media), loop
+                        bot.send_audio(chat_id=int(user_id), audio=media.media), loop
                     )
-                    result = fut.result()
+                    result = fut.result(timeout=60)
                     if result.audio:
-                        file = asyncio.run_coroutine_threadsafe(
-                            bot.get_file(result.audio.file_id), loop
-                        ).result()
-                        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-                        save_message(user_id, 'admin', f'[audio]{file_url}')
+                        try:
+                            file = asyncio.run_coroutine_threadsafe(
+                                bot.get_file(result.audio.file_id), loop
+                            ).result(timeout=30)
+                            if file.file_path.startswith('http'):
+                                file_url = file.file_path
+                            else:
+                                file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+                            save_message(user_id, 'admin', f'[audio]{file_url}')
+                        except Exception as e:
+                            print(f"Error processing single audio: {e}")
+                            save_message(user_id, 'admin', f'[audio]sent')
                 sent = True
         except Exception as e:
             print(f"Telegram file send error: {e}")
